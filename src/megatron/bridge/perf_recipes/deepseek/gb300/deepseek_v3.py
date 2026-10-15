@@ -350,6 +350,10 @@ def deepseek_v3_pretrain_64gpu_gb300_fp8mx_fsdp_config() -> ConfigContainer:
     cfg.model.fp8_param = True
     cfg.model.moe_router_dtype = "bf16"
 
+    # Recompute not needed.
+    cfg.model.recompute_granularity = None
+    cfg.model.recompute_modules = []
+
     _enable_deepseek_full_iteration(cfg)
     cfg.model.fine_grained_offloading_max_inflight_offloads = 1
 
@@ -388,9 +392,9 @@ def deepseek_v3_pretrain_64gpu_gb300_fp8mx_mfsdp2_config() -> ConfigContainer:
     cfg.ddp.megatron_fsdp_version = 2
 
     # Need a fix
-    # cfg.comm_overlap.overlap_moe_expert_parallel_comm = False
+    cfg.comm_overlap.overlap_moe_expert_parallel_comm = False
     # delay_wgrad_compute is only valid alongside that overlap.
-    # cfg.comm_overlap.delay_wgrad_compute = False
+    cfg.comm_overlap.delay_wgrad_compute = False
 
     return cfg
 
