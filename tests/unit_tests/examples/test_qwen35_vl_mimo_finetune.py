@@ -395,3 +395,16 @@ def test_validate_rejects_reorder_overlap_under_single_hardware_queue(monkeypatc
         assert module._validate_mimo_batch_sizes(empty, _reorder_args()) == []
     finally:
         sys.modules.pop(name, None)
+
+
+def test_component_parser_accepts_expert_parallelism():
+    name = "qwen35_vl_mimo_expert_parallelism"
+    try:
+        module = _load_example_module(name)
+        component, config = module._parse_component_spec("language=tp=1,dp=4,ep=4,etp=1,rank_offset=0")
+        assert component == "language"
+        assert config.expert_model_parallel_size == 4
+        assert config.expert_tensor_parallel_size == 1
+        assert config.total_ranks == 4
+    finally:
+        sys.modules.pop(name, None)
