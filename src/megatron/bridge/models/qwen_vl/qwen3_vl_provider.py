@@ -25,7 +25,9 @@ from typing import ClassVar, List, Optional
 
 from megatron.core.models.gpt import GPTModel as MCoreGPTModel
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.transformer.enums import LayerType
 from megatron.core.transformer.spec_utils import ModuleSpec
+from megatron.core.transformer.transformer_block import get_num_layers_to_build
 from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLTextConfig, Qwen3VLVisionConfig
 from transformers.models.qwen3_vl_moe.configuration_qwen3_vl_moe import Qwen3VLMoeTextConfig
 
@@ -408,13 +410,26 @@ def _qwen3_build_language_model_spec(
     provider: Qwen3VLModelProvider | Qwen3VLMoEModelProvider, pp_rank: int | None = 0
 ) -> ModuleSpec:
     """Build the Qwen3-VL language model with multimodal RoPE."""
-    if provider.vision_config.deepstack_visual_indexes and (
-        provider.tensor_model_parallel_size != 1
-        or provider.pipeline_model_parallel_size != 1
-        or provider.context_parallel_size != 1
-        or provider.sequence_parallel
-    ):
-        raise ValueError("Qwen3-VL DeepStack MIMO currently requires TP=PP=CP=1 and sequence_parallel=False.")
+    deepstack_count = len(provider.vision_config.deepstack_visual_indexes)
+    if deepstack_count:
+        if (
+            provider.tensor_model_parallel_size != 1
+            or provider.context_parallel_size != 1
+            or provider.sequence_parallel
+        ):
+            raise ValueError("Qwen3-VL DeepStack MIMO currently requires TP=CP=1 and sequence_parallel=False.")
+        # All auxiliary features are consumed by the first decoder chunk.
+        # Use the actual partition, including uneven and virtual PP splits.
+        layout = provider.pipeline_model_parallel_layout
+        if layout is not None:
+            first_stage_layers = layout.get_num_layers_to_build(layer_type=LayerType.decoder, vp_stage=0, pp_rank=0)
+        else:
+            first_stage_layers = get_num_layers_to_build(provider, vp_stage=0, pp_rank=0)
+        if first_stage_layers < deepstack_count:
+            raise ValueError(
+                f"Qwen3-VL DeepStack MIMO requires at least {deepstack_count} decoder layers in the first "
+                f"pipeline stage's first chunk, got {first_stage_layers}."
+            )
 
     return ModuleSpec(
         module=Qwen3VLMIMOGPTModel,

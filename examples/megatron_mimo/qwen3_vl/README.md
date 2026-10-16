@@ -49,7 +49,11 @@ processor and pretrained MIMO checkpoint explicitly.
 
 ## Limits
 
-DeepStack MIMO currently requires language TP=PP=CP=1 and sequence parallelism
-disabled. Expert parallelism is supported within the language DP group. Use
-non-colocated components. Packed sequences, video, and MTP are not validated
+DeepStack MIMO currently requires language TP=CP=1 and sequence parallelism
+disabled. The first language pipeline stage's first chunk must contain all
+DeepStack injection layers (the first three decoder layers for the published
+Qwen3-VL configurations). This is checked against the configured layer partition,
+including uneven and virtual pipeline splits. Distributed PP training is not
+validated by this example. Expert parallelism is supported within the language
+DP group. Use non-colocated components. Packed sequences, video, and MTP are not validated
 by this example. Standard non-MIMO providers keep their existing behavior.

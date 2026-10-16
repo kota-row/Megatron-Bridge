@@ -29,7 +29,7 @@ pytestmark = pytest.mark.unit
 def model_pair(request):
     provider_cls, bridge_cls = request.param
     kwargs = dict(
-        num_layers=2, hidden_size=128, num_attention_heads=4, num_query_groups=4, kv_channels=32, vocab_size=256
+        num_layers=4, hidden_size=128, num_attention_heads=4, num_query_groups=4, kv_channels=32, vocab_size=256
     )
     if provider_cls is Qwen3VLMoEModelProvider:
         kwargs.update(num_moe_experts=8, moe_router_topk=2, moe_ffn_hidden_size=64)
@@ -128,15 +128,63 @@ def test_default_routes_and_factory(model_pair):
     source.provider_bridge.assert_called_once_with(hf_source)
 
 
-@pytest.mark.parametrize(
-    "field", ["tensor_model_parallel_size", "pipeline_model_parallel_size", "context_parallel_size"]
-)
+@pytest.mark.parametrize("field", ["tensor_model_parallel_size", "context_parallel_size"])
 def test_deepstack_rejects_unimplemented_sharding(model_pair, field):
     provider, _ = model_pair
     assert hasattr(provider, field)
     setattr(provider, field, 2)
     with pytest.raises(ValueError, match="DeepStack MIMO"):
         provider.build_language_model_spec()
+
+
+@pytest.mark.parametrize("pp_rank", [0, 1])
+@pytest.mark.parametrize(
+    ("layers", "first_layers", "vp_size", "embedding_split", "accepted"),
+    [
+        (6, None, None, False, True),  # Exactly three layers on the first stage.
+        (4, None, None, False, False),
+        (8, 3, None, False, True),
+        (8, 2, None, False, False),
+        (12, None, 2, False, True),  # Count the first virtual chunk, not the whole rank.
+        (8, None, 2, False, False),
+        (7, None, None, True, True),
+        (5, None, None, True, False),  # An embedding slot is not a decoder layer.
+    ],
+)
+def test_deepstack_pipeline_first_chunk_capacity(
+    model_pair, monkeypatch, pp_rank, layers, first_layers, vp_size, embedding_split, accepted
+):
+    provider, _ = model_pair
+    provider.num_layers = layers
+    provider.pipeline_model_parallel_size = 2
+    provider.num_layers_in_first_pipeline_stage = first_layers
+    provider.virtual_pipeline_model_parallel_size = vp_size
+    provider.account_for_embedding_in_pipeline_split = embedding_split
+    monkeypatch.setattr(provider, "build_language_spec", MagicMock(return_value=ModuleSpec(module=object)))
+    if accepted:
+        assert provider.build_language_model_spec(pp_rank=pp_rank).module is Qwen3VLGPTModel
+    else:
+        with pytest.raises(ValueError, match="at least 3 decoder layers.*got 2"):
+            provider.build_language_model_spec(pp_rank=pp_rank)
+
+
+@pytest.mark.parametrize("pp_rank", [0, 1])
+@pytest.mark.parametrize("first_layers", [2, 3])
+def test_deepstack_custom_pipeline_layout(model_pair, monkeypatch, pp_rank, first_layers):
+    from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
+
+    provider, _ = model_pair
+    provider.num_layers = 8
+    provider.pipeline_model_parallel_size = 2
+    provider.pipeline_model_parallel_layout = PipelineParallelLayerLayout(
+        f"Et*{first_layers}|t*{8 - first_layers}L", pipeline_model_parallel_size=2
+    )
+    monkeypatch.setattr(provider, "build_language_spec", MagicMock(return_value=ModuleSpec(module=object)))
+    if first_layers == 3:
+        assert provider.build_language_model_spec(pp_rank=pp_rank).module is Qwen3VLGPTModel
+    else:
+        with pytest.raises(ValueError, match="at least 3 decoder layers.*got 2"):
+            provider.build_language_model_spec(pp_rank=pp_rank)
 
 
 def test_deepstack_payload_preserves_features_and_gradients(monkeypatch):
