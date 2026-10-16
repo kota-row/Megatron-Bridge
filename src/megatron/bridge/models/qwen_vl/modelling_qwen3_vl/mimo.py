@@ -19,7 +19,6 @@ from typing import Any
 import torch
 from megatron.core.models.mimo import MimoModel
 
-from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.text_model import Qwen3VLGPTModel
 from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.vision_model import Qwen3VLVisionModel
 
 
@@ -32,33 +31,17 @@ class Qwen3VLMIMOVisionModel(Qwen3VLVisionModel):
         return torch.cat([primary, *deepstack], dim=-1)
 
 
-class Qwen3VLMIMOGPTModel(Qwen3VLGPTModel):
-    """Receive DeepStack kwargs from the MIMO embedding assembly step."""
-
-    _mimo_visual_inputs: tuple[torch.Tensor, list[torch.Tensor]] | None = None
-
-    def forward(self, *args: Any, **kwargs: Any) -> torch.Tensor:
-        """Consume this microbatch's visual features before running the decoder."""
-        visual_inputs = self._mimo_visual_inputs
-        self._mimo_visual_inputs = None
-        if visual_inputs is not None:
-            kwargs["visual_pos_masks"], kwargs["deepstack_visual_embeds"] = visual_inputs
-        return super().forward(*args, **kwargs)
-
-
 class Qwen3VLMIMOModel(MimoModel):
-    """Split the image boundary payload before aligning primary embeddings."""
+    """Pass each microbatch's DeepStack features explicitly to the decoder."""
 
-    def align_embeddings_by_token_positions(
+    def _unpack_image_inputs(
         self,
-        modality_embeddings: dict[str, torch.Tensor],
         input_ids: torch.Tensor,
-        special_token_ids: dict[str, int],
-        modality_token_indices: dict[str, torch.Tensor] | None = None,
-    ) -> torch.Tensor:
-        """Route auxiliary features to Qwen's decoder with their visual mask."""
-        images = modality_embeddings.get("images")
-        visual_inputs = None
+        input_tensors: dict[str, torch.Tensor] | None,
+    ) -> tuple[dict[str, torch.Tensor] | None, dict[str, Any]]:
+        """Return primary inputs and auxiliary kwargs without retaining tensors."""
+        images = input_tensors.get("images") if input_tensors else None
+        language_kwargs: dict[str, Any] = {}
         if images is not None and images.numel():
             config = self.mimo_config.language_model_spec.params["config"]
             count = len(config.vision_config.deepstack_visual_indexes)
@@ -66,14 +49,47 @@ class Qwen3VLMIMOModel(MimoModel):
             if images.shape[-1] != expected_width:
                 raise ValueError(f"Qwen3-VL image payload has width {images.shape[-1]}, expected {expected_width}.")
             primary, *deepstack = images.split(config.hidden_size, dim=-1)
-            modality_embeddings = dict(modality_embeddings, images=primary)
+            input_tensors = dict(input_tensors or {}, images=primary)
             if deepstack:
-                visual_inputs = (input_ids == special_token_ids["images"], deepstack)
-        output = super().align_embeddings_by_token_positions(
-            modality_embeddings, input_ids, special_token_ids, modality_token_indices
+                language_kwargs = {
+                    "visual_pos_masks": input_ids == self.special_token_ids["images"],
+                    "deepstack_visual_embeds": deepstack,
+                }
+        return input_tensors, language_kwargs
+
+    def _forward_language_module(
+        self,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor | None,
+        attention_mask: torch.Tensor | None,
+        loss_mask: torch.Tensor | None,
+        labels: torch.Tensor | None,
+        input_tensors: dict[str, torch.Tensor] | None,
+        *args: Any,
+        **kwargs: Any,
+    ) -> tuple[Any, torch.Tensor | None]:
+        """Unpack image features on the first language stage for this call only."""
+        language_kwargs = dict(kwargs.pop("language_model_kwargs", None) or {})
+        if self.role.is_first_stage("language"):
+            input_tensors, visual_kwargs = self._unpack_image_inputs(input_ids, input_tensors)
+            conflicts = language_kwargs.keys() & visual_kwargs.keys()
+            if conflicts:
+                raise ValueError(f"DeepStack arguments are supplied twice: {sorted(conflicts)}")
+            language_kwargs.update(visual_kwargs)
+        return super()._forward_language_module(
+            input_ids,
+            position_ids,
+            attention_mask,
+            loss_mask,
+            labels,
+            input_tensors,
+            *args,
+            language_model_kwargs=language_kwargs,
+            **kwargs,
         )
-        language_model = self.language_model
-        while hasattr(language_model, "module"):
-            language_model = language_model.module
-        language_model._mimo_visual_inputs = visual_inputs
-        return output
+
+    def _forward_all_modules(self, *args: Any, **kwargs: Any) -> tuple[Any, torch.Tensor | None]:
+        """Require disjoint vision/language components for DeepStack transport."""
+        if self.mimo_config.language_model_spec.params["config"].vision_config.deepstack_visual_indexes:
+            raise NotImplementedError("Qwen3-VL DeepStack MIMO requires non-colocated components.")
+        return super()._forward_all_modules(*args, **kwargs)

@@ -9,6 +9,14 @@ DeepStack features. The language component restores the visual mask and injects
 the auxiliary features into the decoder. Discarding those features changes the
 model even when a checkpoint round-trip succeeds.
 
+This integration requires Megatron Core's `language_model_kwargs` support in
+`MimoModel` (see the `feat/mimo-language-model-kwargs` branch of
+[kota-row/Megatron-LM](https://github.com/kota-row/Megatron-LM/tree/feat/mimo-language-model-kwargs)).
+The image payload is unpacked on the first language stage and passed explicitly
+to the native Qwen3-VL language model for each forward call. No microbatch
+features are stored on the model instance. Extra arguments are rank-local;
+MIMO does not communicate or shard them automatically.
+
 ## Dense conversion
 
 Run import and export as separate processes to exercise checkpoint reload:

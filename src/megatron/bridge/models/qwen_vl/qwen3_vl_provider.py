@@ -33,11 +33,11 @@ from transformers.models.qwen3_vl_moe.configuration_qwen3_vl_moe import Qwen3VLM
 
 from megatron.bridge.models.gpt_provider import GPTModelProvider
 from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.mimo import (
-    Qwen3VLMIMOGPTModel,
     Qwen3VLMIMOModel,
     Qwen3VLMIMOVisionModel,
 )
 from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.model import Qwen3VLModel
+from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.text_model import Qwen3VLGPTModel
 
 
 @dataclass
@@ -432,7 +432,7 @@ def _qwen3_build_language_model_spec(
             )
 
     return ModuleSpec(
-        module=Qwen3VLMIMOGPTModel,
+        module=Qwen3VLGPTModel,
         params={
             "config": provider,
             "transformer_layer_spec": provider.build_language_spec(pp_rank=pp_rank),

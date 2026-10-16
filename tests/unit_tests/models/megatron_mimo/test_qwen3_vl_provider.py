@@ -14,8 +14,8 @@ from megatron.bridge.models.megatron_mimo.megatron_mimo_config import (
 )
 from megatron.bridge.models.megatron_mimo.megatron_mimo_provider import MegatronMIMOProvider
 from megatron.bridge.models.qwen_vl import qwen3_vl_provider as provider_module
-from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.mimo import Qwen3VLMIMOGPTModel as Qwen3VLGPTModel
 from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.mimo import Qwen3VLMIMOVisionModel as Qwen3VLVisionModel
+from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.text_model import Qwen3VLGPTModel
 from megatron.bridge.models.qwen_vl.qwen3_vl_bridge import Qwen3VLBridge, Qwen3VLMoEBridge
 from megatron.bridge.models.qwen_vl.qwen3_vl_provider import Qwen3VLModelProvider, Qwen3VLMoEModelProvider
 
@@ -213,32 +213,104 @@ def test_deepstack_payload_preserves_features_and_gradients(monkeypatch):
         )
     )
     ids = torch.tensor([[3, 9, 9, 4]])
-    text = torch.randn(2, 4, requires_grad=True)
-    result = model.align_embeddings_by_token_positions({"images": payload, "text": text}, ids, {"images": 9})
-    torch.testing.assert_close(result[:, 0], torch.stack([text[0], primary[0], primary[1], text[1]]))
-    mask, received = model.language_model._mimo_visual_inputs
-    assert torch.equal(mask, ids == 9)
+    model.special_token_ids = {"images": 9}
+    inputs = {"images": payload}
+    primary_inputs, kwargs = model._unpack_image_inputs(ids, inputs)
+    assert inputs["images"] is payload
+    torch.testing.assert_close(primary_inputs["images"], primary)
+    assert torch.equal(kwargs["visual_pos_masks"], ids == 9)
+    received = kwargs["deepstack_visual_embeds"]
     for actual, expected in zip(received, auxiliary):
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-    (result.sum() + sum(t.sum() for t in received)).backward()
-    for tensor in [primary, text, *auxiliary]:
+    (primary_inputs["images"].sum() + sum(t.sum() for t in received)).backward()
+    for tensor in [primary, *auxiliary]:
         assert torch.equal(tensor.grad, torch.ones_like(tensor))
 
 
-def test_deepstack_kwargs_are_consumed_once(monkeypatch):
-    from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.mimo import Qwen3VLMIMOGPTModel
-    from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.text_model import Qwen3VLGPTModel as NativeGPT
+def _deepstack_model(first_stage=True):
+    from types import SimpleNamespace
 
-    calls = []
-    monkeypatch.setattr(NativeGPT, "forward", lambda self, **kwargs: calls.append(kwargs) or torch.ones(1))
-    language = Qwen3VLMIMOGPTModel.__new__(Qwen3VLMIMOGPTModel)
-    torch.nn.Module.__init__(language)
-    mask = torch.tensor([[True, False]])
-    features = [torch.randn(1, 4)]
-    language._mimo_visual_inputs = (mask, features)
-    language.forward(input_ids=None)
-    language.forward(input_ids=None)
-    assert calls[0]["visual_pos_masks"] is mask
-    assert calls[0]["deepstack_visual_embeds"] is features
-    assert "visual_pos_masks" not in calls[1]
-    assert language._mimo_visual_inputs is None
+    from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.mimo import Qwen3VLMIMOModel
+
+    model = Qwen3VLMIMOModel.__new__(Qwen3VLMIMOModel)
+    torch.nn.Module.__init__(model)
+    model.special_token_ids = {"images": 9}
+    model.role = SimpleNamespace(is_first_stage=lambda name: first_stage)
+    model.mimo_config = SimpleNamespace(
+        language_model_spec=ModuleSpec(
+            module=object,
+            params={
+                "config": SimpleNamespace(
+                    hidden_size=4, vision_config=SimpleNamespace(deepstack_visual_indexes=[0, 1])
+                )
+            },
+        )
+    )
+    return model
+
+
+def test_deepstack_microbatches_keep_their_own_graphs(monkeypatch):
+    from megatron.core.models.mimo import MimoModel
+
+    captured = []
+
+    def forward(self, ids, positions, attention, loss_mask, labels, inputs, **kwargs):
+        extra = kwargs["language_model_kwargs"]
+        captured.append(extra)
+        return inputs["images"].square().sum() + sum(
+            x.square().sum() for x in extra["deepstack_visual_embeds"]
+        ), loss_mask
+
+    monkeypatch.setattr(MimoModel, "_forward_language_module", forward)
+    model = _deepstack_model()
+    ids = torch.tensor([[9, 9]])
+    payloads = [torch.full((2, 12), float(i), requires_grad=True) for i in (1, 2)]
+    caller_kwargs = {"custom_option": 7}
+    outputs = [
+        model._forward_language_module(
+            ids, None, None, None, None, {"images": p}, language_model_kwargs=caller_kwargs
+        )[0]
+        for p in payloads
+    ]
+    for output in reversed(outputs):
+        output.backward()
+    for payload in payloads:
+        torch.testing.assert_close(payload.grad, 2 * payload)
+    assert caller_kwargs == {"custom_option": 7}
+    assert all(extra["custom_option"] == 7 for extra in captured)
+    assert "_mimo_visual_inputs" not in vars(model)
+
+
+@pytest.mark.parametrize("first_stage", [True, False])
+def test_deepstack_text_or_later_stage_does_not_inject_features(monkeypatch, first_stage):
+    from megatron.core.models.mimo import MimoModel
+
+    captured = []
+    monkeypatch.setattr(MimoModel, "_forward_language_module", lambda self, *args, **kwargs: captured.append(kwargs))
+    model = _deepstack_model(first_stage)
+    model._forward_language_module(torch.tensor([[3, 4]]), None, None, None, None, None)
+    assert captured[0]["language_model_kwargs"] == {}
+
+
+def test_deepstack_rejects_duplicate_features(monkeypatch):
+    model = _deepstack_model()
+    with pytest.raises(ValueError, match="supplied twice"):
+        model._forward_language_module(
+            torch.tensor([[9, 9]]),
+            None,
+            None,
+            None,
+            None,
+            {"images": torch.ones(2, 12)},
+            language_model_kwargs={"deepstack_visual_embeds": []},
+        )
+
+
+def test_deepstack_rejects_colocated_components():
+    with pytest.raises(NotImplementedError, match="non-colocated"):
+        _deepstack_model()._forward_all_modules()
+
+
+def test_deepstack_rejects_incorrect_payload_width():
+    with pytest.raises(ValueError, match="width 4, expected 12"):
+        _deepstack_model()._unpack_image_inputs(torch.tensor([[9, 9]]), {"images": torch.ones(2, 4)})
