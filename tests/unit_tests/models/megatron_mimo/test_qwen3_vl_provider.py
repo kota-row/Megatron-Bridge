@@ -283,10 +283,10 @@ def test_deepstack_boundary_preserves_features_and_microbatch_gradients(deepstac
     torch.nn.Module.__init__(encoder)
     tensors, outputs = [], []
     caller_kwargs = {"custom_option": 7}
-    for value in (1.0, 2.0):
-        primary = torch.full((2, config.hidden_size), value, requires_grad=True)
+    for _ in range(2):
+        primary = torch.randn(2, config.hidden_size, requires_grad=True)
         auxiliary = [
-            torch.full_like(primary, value, requires_grad=True) for _ in config.vision_config.deepstack_visual_indexes
+            torch.randn_like(primary, requires_grad=True) for _ in config.vision_config.deepstack_visual_indexes
         ]
         monkeypatch.setattr(NativeVision, "forward", lambda *args, **kwargs: (primary, auxiliary))
         inputs = {"images": encoder()}
