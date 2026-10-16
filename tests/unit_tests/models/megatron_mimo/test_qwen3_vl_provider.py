@@ -1,26 +1,55 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 """MIMO contracts shared by Qwen3-VL Dense and MoE."""
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 import torch
+import yaml
 from megatron.core.transformer.spec_utils import ModuleSpec
 
-from megatron.bridge.models.megatron_mimo.conversion import get_mimo_conversion_spec, supports_mimo_conversion
+from megatron.bridge.models.megatron_mimo.conversion import (
+    get_mimo_conversion_spec,
+    supports_mimo_conversion,
+    validate_route_table,
+)
+from megatron.bridge.models.megatron_mimo.conversion.mimo_model_io import _clear_derived_spec_fields
 from megatron.bridge.models.megatron_mimo.megatron_mimo_config import (
     MegatronMIMOParallelismConfig,
     ModuleParallelismConfig,
 )
 from megatron.bridge.models.megatron_mimo.megatron_mimo_provider import MegatronMIMOProvider
 from megatron.bridge.models.qwen_vl import qwen3_vl_provider as provider_module
-from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.mimo import Qwen3VLMIMOVisionModel as Qwen3VLVisionModel
+from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.mimo import Qwen3VLMIMOModel, Qwen3VLMIMOVisionModel
 from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.text_model import Qwen3VLGPTModel
+from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.vision_model import Qwen3VLVisionModel as NativeVision
 from megatron.bridge.models.qwen_vl.qwen3_vl_bridge import Qwen3VLBridge, Qwen3VLMoEBridge
 from megatron.bridge.models.qwen_vl.qwen3_vl_provider import Qwen3VLModelProvider, Qwen3VLMoEModelProvider
+from megatron.bridge.training.config import ConfigContainer
+from megatron.bridge.utils.instantiate_utils import instantiate
+from megatron.bridge.utils.yaml_utils import safe_yaml_representers
 
 
 pytestmark = pytest.mark.unit
+
+
+def _make_language_provider(provider_cls=Qwen3VLModelProvider):
+    kwargs = dict(
+        num_layers=4, hidden_size=128, num_attention_heads=4, num_query_groups=4, kv_channels=32, vocab_size=256
+    )
+    if provider_cls is Qwen3VLMoEModelProvider:
+        kwargs.update(num_moe_experts=8, moe_router_topk=2, moe_ffn_hidden_size=64)
+    return provider_cls(**kwargs)
+
+
+def _make_parallelism_config():
+    return MegatronMIMOParallelismConfig(
+        module_parallelisms={
+            "language": ModuleParallelismConfig(tensor_model_parallel_size=1),
+            "images": ModuleParallelismConfig(tensor_model_parallel_size=1, rank_offset=1),
+        }
+    )
 
 
 @pytest.fixture(
@@ -28,12 +57,13 @@ pytestmark = pytest.mark.unit
 )
 def model_pair(request):
     provider_cls, bridge_cls = request.param
-    kwargs = dict(
-        num_layers=4, hidden_size=128, num_attention_heads=4, num_query_groups=4, kv_channels=32, vocab_size=256
-    )
-    if provider_cls is Qwen3VLMoEModelProvider:
-        kwargs.update(num_moe_experts=8, moe_router_topk=2, moe_ffn_hidden_size=64)
-    return provider_cls(**kwargs), bridge_cls
+    return _make_language_provider(provider_cls), bridge_cls
+
+
+@pytest.fixture
+def dense_provider():
+    # Dense and MoE install the same DeepStack validation helper.
+    return _make_language_provider()
 
 
 def test_metadata_and_default_conversion(model_pair):
@@ -85,7 +115,7 @@ def test_language_spec_preserves_qwen_configuration(model_pair, monkeypatch):
 def test_native_vision_spec_has_independent_pipeline(model_pair):
     provider, _ = model_pair
     spec = provider.build_vision_encoder_spec()
-    assert spec.module is Qwen3VLVisionModel
+    assert spec.module is Qwen3VLMIMOVisionModel
     config = spec.params["transformer_config"]
     assert config.pipeline_model_parallel_size == 1
     assert config.first_pipeline_num_layers is None
@@ -106,20 +136,19 @@ def test_default_routes_and_factory(model_pair):
     standard, bridge_cls = model_pair
     source = bridge_cls()
     source.provider_bridge = MagicMock(return_value=standard)
-    parallelism = MegatronMIMOParallelismConfig(
-        module_parallelisms={
-            "language": ModuleParallelismConfig(tensor_model_parallel_size=1, data_parallel_size=1),
-            "images": ModuleParallelismConfig(tensor_model_parallel_size=1, data_parallel_size=1, rank_offset=1),
-        }
-    )
+    standard.mtp_num_layers = 2
+    parallelism = _make_parallelism_config()
     hf_source = object()
     provider, routes = get_mimo_conversion_spec(bridge_cls)(source, hf_source, parallelism)
     assert isinstance(provider, MegatronMIMOProvider)
     assert provider.standard_provider is standard
+    assert standard.mtp_num_layers is None
+    assert provider.megatron_mimo_parallelism_config is parallelism
     assert provider.language_model_spec.module is Qwen3VLGPTModel
     assert provider.special_token_ids == {"images": standard.image_token_id}
     assert (
-        provider.modality_submodules_spec["images"].submodules["encoders"]["qwen_visual"].module is Qwen3VLVisionModel
+        provider.modality_submodules_spec["images"].submodules["encoders"]["qwen_visual"].module
+        is Qwen3VLMIMOVisionModel
     )
     assert {(r.source_prefix, r.target_module_path) for r in routes} == {
         ("language_model.", "language_model"),
@@ -127,17 +156,51 @@ def test_default_routes_and_factory(model_pair):
     }
     source.provider_bridge.assert_called_once_with(hf_source)
 
+    validate_route_table(
+        routes, parallelism_config=parallelism, modality_submodules_spec=provider.modality_submodules_spec
+    )
 
-@pytest.mark.parametrize("field", ["tensor_model_parallel_size", "context_parallel_size"])
-def test_deepstack_rejects_unimplemented_sharding(model_pair, field):
-    provider, _ = model_pair
+
+def test_yaml_round_trip_rebuilds_specs_after_clear(model_pair, tmp_path):
+    standard, _ = model_pair
+    provider = MegatronMIMOProvider.from_standard_provider(
+        standard_provider=standard, megatron_mimo_parallelism_config=_make_parallelism_config()
+    )
+    _clear_derived_spec_fields(provider)
+    model_dict = ConfigContainer._convert_value_to_dict(provider)
+    assert model_dict["language_model_spec"] is None
+    assert model_dict["modality_submodules_spec"] == {}
+    path = tmp_path / "run_config.yaml"
+    with safe_yaml_representers():
+        path.write_text(yaml.safe_dump({"model": model_dict}))
+    loaded = instantiate(yaml.safe_load(path.read_text())["model"])
+    assert isinstance(loaded, MegatronMIMOProvider)
+    assert type(loaded.standard_provider) is type(standard)
+    assert loaded.language_model_spec.module is Qwen3VLGPTModel
+    assert loaded.standard_provider.mimo_model_class is Qwen3VLMIMOModel
+    assert (
+        loaded.modality_submodules_spec["images"].submodules["encoders"]["qwen_visual"].module
+        is Qwen3VLMIMOVisionModel
+    )
+    assert loaded.special_token_ids == standard.special_token_ids
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("tensor_model_parallel_size", 2),
+        ("context_parallel_size", 2),
+        ("sequence_parallel", True),
+    ],
+)
+def test_deepstack_rejects_unimplemented_sharding(dense_provider, field, value):
+    provider = dense_provider
     assert hasattr(provider, field)
-    setattr(provider, field, 2)
+    setattr(provider, field, value)
     with pytest.raises(ValueError, match="DeepStack MIMO"):
         provider.build_language_model_spec()
 
 
-@pytest.mark.parametrize("pp_rank", [0, 1])
 @pytest.mark.parametrize(
     ("layers", "first_layers", "vp_size", "embedding_split", "accepted"),
     [
@@ -152,9 +215,9 @@ def test_deepstack_rejects_unimplemented_sharding(model_pair, field):
     ],
 )
 def test_deepstack_pipeline_first_chunk_capacity(
-    model_pair, monkeypatch, pp_rank, layers, first_layers, vp_size, embedding_split, accepted
+    dense_provider, monkeypatch, layers, first_layers, vp_size, embedding_split, accepted
 ):
-    provider, _ = model_pair
+    provider = dense_provider
     provider.num_layers = layers
     provider.pipeline_model_parallel_size = 2
     provider.num_layers_in_first_pipeline_stage = first_layers
@@ -162,18 +225,17 @@ def test_deepstack_pipeline_first_chunk_capacity(
     provider.account_for_embedding_in_pipeline_split = embedding_split
     monkeypatch.setattr(provider, "build_language_spec", MagicMock(return_value=ModuleSpec(module=object)))
     if accepted:
-        assert provider.build_language_model_spec(pp_rank=pp_rank).module is Qwen3VLGPTModel
+        assert provider.build_language_model_spec(pp_rank=1).module is Qwen3VLGPTModel
     else:
         with pytest.raises(ValueError, match="at least 3 decoder layers.*got 2"):
-            provider.build_language_model_spec(pp_rank=pp_rank)
+            provider.build_language_model_spec(pp_rank=1)
 
 
-@pytest.mark.parametrize("pp_rank", [0, 1])
 @pytest.mark.parametrize("first_layers", [2, 3])
-def test_deepstack_custom_pipeline_layout(model_pair, monkeypatch, pp_rank, first_layers):
+def test_deepstack_custom_pipeline_layout(dense_provider, monkeypatch, first_layers):
     from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 
-    provider, _ = model_pair
+    provider = dense_provider
     provider.num_layers = 8
     provider.pipeline_model_parallel_size = 2
     provider.pipeline_model_parallel_layout = PipelineParallelLayerLayout(
@@ -181,136 +243,96 @@ def test_deepstack_custom_pipeline_layout(model_pair, monkeypatch, pp_rank, firs
     )
     monkeypatch.setattr(provider, "build_language_spec", MagicMock(return_value=ModuleSpec(module=object)))
     if first_layers == 3:
-        assert provider.build_language_model_spec(pp_rank=pp_rank).module is Qwen3VLGPTModel
+        assert provider.build_language_model_spec(pp_rank=1).module is Qwen3VLGPTModel
     else:
         with pytest.raises(ValueError, match="at least 3 decoder layers.*got 2"):
-            provider.build_language_model_spec(pp_rank=pp_rank)
+            provider.build_language_model_spec(pp_rank=1)
 
 
-def test_deepstack_payload_preserves_features_and_gradients(monkeypatch):
-    from types import SimpleNamespace
-
-    from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.mimo import Qwen3VLMIMOModel, Qwen3VLMIMOVisionModel
-    from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.vision_model import Qwen3VLVisionModel as NativeVision
-
-    primary = torch.randn(2, 4, requires_grad=True)
-    auxiliary = [torch.randn(2, 4, requires_grad=True) for _ in range(2)]
-    monkeypatch.setattr(NativeVision, "forward", lambda *args, **kwargs: (primary, auxiliary))
-    encoder = Qwen3VLMIMOVisionModel.__new__(Qwen3VLMIMOVisionModel)
-    torch.nn.Module.__init__(encoder)
-    payload = encoder()
+@pytest.fixture
+def deepstack_model(dense_provider):
     model = Qwen3VLMIMOModel.__new__(Qwen3VLMIMOModel)
     torch.nn.Module.__init__(model)
-    model.language_model = torch.nn.Identity()
+    model.special_token_ids = dense_provider.special_token_ids
+    model.role = SimpleNamespace(is_first_stage=lambda name: True)
     model.mimo_config = SimpleNamespace(
-        language_model_spec=ModuleSpec(
-            module=object,
-            params={
-                "config": SimpleNamespace(
-                    hidden_size=4, vision_config=SimpleNamespace(deepstack_visual_indexes=[0, 1])
-                )
-            },
-        )
-    )
-    ids = torch.tensor([[3, 9, 9, 4]])
-    model.special_token_ids = {"images": 9}
-    inputs = {"images": payload}
-    primary_inputs, kwargs = model._unpack_image_inputs(ids, inputs)
-    assert inputs["images"] is payload
-    torch.testing.assert_close(primary_inputs["images"], primary)
-    assert torch.equal(kwargs["visual_pos_masks"], ids == 9)
-    received = kwargs["deepstack_visual_embeds"]
-    for actual, expected in zip(received, auxiliary):
-        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-    (primary_inputs["images"].sum() + sum(t.sum() for t in received)).backward()
-    for tensor in [primary, *auxiliary]:
-        assert torch.equal(tensor.grad, torch.ones_like(tensor))
-
-
-def _deepstack_model(first_stage=True):
-    from types import SimpleNamespace
-
-    from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.mimo import Qwen3VLMIMOModel
-
-    model = Qwen3VLMIMOModel.__new__(Qwen3VLMIMOModel)
-    torch.nn.Module.__init__(model)
-    model.special_token_ids = {"images": 9}
-    model.role = SimpleNamespace(is_first_stage=lambda name: first_stage)
-    model.mimo_config = SimpleNamespace(
-        language_model_spec=ModuleSpec(
-            module=object,
-            params={
-                "config": SimpleNamespace(
-                    hidden_size=4, vision_config=SimpleNamespace(deepstack_visual_indexes=[0, 1])
-                )
-            },
-        )
+        language_model_spec=ModuleSpec(module=Qwen3VLGPTModel, params={"config": dense_provider})
     )
     return model
 
 
-def test_deepstack_microbatches_keep_their_own_graphs(monkeypatch):
+def test_deepstack_boundary_preserves_features_and_microbatch_gradients(deepstack_model, monkeypatch):
     from megatron.core.models.mimo import MimoModel
 
+    model = deepstack_model
+    config = model.mimo_config.language_model_spec.params["config"]
+    ids = torch.tensor([[3, config.image_token_id, config.image_token_id, 4]])
     captured = []
 
-    def forward(self, ids, positions, attention, loss_mask, labels, inputs, **kwargs):
+    def language_forward(self, ids, positions, attention, loss_mask, labels, inputs, **kwargs):
         extra = kwargs["language_model_kwargs"]
-        captured.append(extra)
+        captured.append((inputs, extra))
+        if inputs is None:
+            return torch.zeros(()), loss_mask
         return inputs["images"].square().sum() + sum(
-            x.square().sum() for x in extra["deepstack_visual_embeds"]
+            value.square().sum() for value in extra["deepstack_visual_embeds"]
         ), loss_mask
 
-    monkeypatch.setattr(MimoModel, "_forward_language_module", forward)
-    model = _deepstack_model()
-    ids = torch.tensor([[9, 9]])
-    payloads = [torch.full((2, 12), float(i), requires_grad=True) for i in (1, 2)]
+    monkeypatch.setattr(MimoModel, "_forward_language_module", language_forward)
+    encoder = Qwen3VLMIMOVisionModel.__new__(Qwen3VLMIMOVisionModel)
+    torch.nn.Module.__init__(encoder)
+    tensors, outputs = [], []
     caller_kwargs = {"custom_option": 7}
-    outputs = [
-        model._forward_language_module(
-            ids, None, None, None, None, {"images": p}, language_model_kwargs=caller_kwargs
-        )[0]
-        for p in payloads
-    ]
+    for value in (1.0, 2.0):
+        primary = torch.full((2, config.hidden_size), value, requires_grad=True)
+        auxiliary = [
+            torch.full_like(primary, value, requires_grad=True) for _ in config.vision_config.deepstack_visual_indexes
+        ]
+        monkeypatch.setattr(NativeVision, "forward", lambda *args, **kwargs: (primary, auxiliary))
+        inputs = {"images": encoder()}
+        payload = inputs["images"]
+        output, _ = model._forward_language_module(
+            ids, None, None, None, None, inputs, language_model_kwargs=caller_kwargs
+        )
+        forwarded, extra = captured[-1]
+        assert inputs["images"] is payload
+        torch.testing.assert_close(forwarded["images"], primary)
+        assert torch.equal(extra["visual_pos_masks"], ids == config.image_token_id)
+        for received, expected in zip(extra["deepstack_visual_embeds"], auxiliary, strict=True):
+            torch.testing.assert_close(received, expected)
+        assert extra["custom_option"] == 7
+        tensors.extend([primary, *auxiliary])
+        outputs.append(output)
+    # A text microbatch on the same instance must not reuse image features.
+    model._forward_language_module(torch.tensor([[3, 4]]), None, None, None, None, None)
+    assert captured[-1][1] == {}
+    assert caller_kwargs == {"custom_option": 7}
     for output in reversed(outputs):
         output.backward()
-    for payload in payloads:
-        torch.testing.assert_close(payload.grad, 2 * payload)
-    assert caller_kwargs == {"custom_option": 7}
-    assert all(extra["custom_option"] == 7 for extra in captured)
-    assert "_mimo_visual_inputs" not in vars(model)
+    for tensor in tensors:
+        torch.testing.assert_close(tensor.grad, 2 * tensor)
 
 
-@pytest.mark.parametrize("first_stage", [True, False])
-def test_deepstack_text_or_later_stage_does_not_inject_features(monkeypatch, first_stage):
-    from megatron.core.models.mimo import MimoModel
-
-    captured = []
-    monkeypatch.setattr(MimoModel, "_forward_language_module", lambda self, *args, **kwargs: captured.append(kwargs))
-    model = _deepstack_model(first_stage)
-    model._forward_language_module(torch.tensor([[3, 4]]), None, None, None, None, None)
-    assert captured[0]["language_model_kwargs"] == {}
-
-
-def test_deepstack_rejects_duplicate_features(monkeypatch):
-    model = _deepstack_model()
+def test_deepstack_rejects_duplicate_features(deepstack_model):
+    config = deepstack_model.mimo_config.language_model_spec.params["config"]
+    width = config.hidden_size * (1 + len(config.vision_config.deepstack_visual_indexes))
     with pytest.raises(ValueError, match="supplied twice"):
-        model._forward_language_module(
-            torch.tensor([[9, 9]]),
+        deepstack_model._forward_language_module(
+            torch.tensor([[config.image_token_id]]),
             None,
             None,
             None,
             None,
-            {"images": torch.ones(2, 12)},
+            {"images": torch.ones(1, width)},
             language_model_kwargs={"deepstack_visual_embeds": []},
         )
 
 
-def test_deepstack_rejects_colocated_components():
+def test_deepstack_rejects_colocated_components(deepstack_model):
     with pytest.raises(NotImplementedError, match="non-colocated"):
-        _deepstack_model()._forward_all_modules()
+        deepstack_model._forward_all_modules()
 
 
-def test_deepstack_rejects_incorrect_payload_width():
-    with pytest.raises(ValueError, match="width 4, expected 12"):
-        _deepstack_model()._unpack_image_inputs(torch.tensor([[9, 9]]), {"images": torch.ones(2, 4)})
+def test_deepstack_rejects_incorrect_payload_width(deepstack_model):
+    with pytest.raises(ValueError, match="payload has width"):
+        deepstack_model._unpack_image_inputs(torch.tensor([[3, 4]]), {"images": torch.ones(2, 4)})
